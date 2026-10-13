@@ -1,0 +1,23 @@
+debug = false
+secret = "<MTG_SECRET>"
+bind-to = "0.0.0.0:3128"
+prefer-ip = "prefer-ipv4"
+auto-update = false
+concurrency = 8192
+
+[network]
+proxies = ["socks5://v2ray:1080"]
+dns = "127.0.0.11"
+
+[network.timeout]
+tcp = "5s"
+idle = "5m"
+
+[defense.blocklist]
+enabled = false
+
+[defense.allowlist]
+enabled = false
+[domain-fronting]
+host = "www.google.com"
+port = 443

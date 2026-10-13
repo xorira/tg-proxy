@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------------------
+# Mini App «Прямой эфир» — сервис `live` из /opt/double-take (порт 8096).
+#
+# Этот файл добавлен РЯДОМ с tcp.yml и ничего в нём не меняет:
+#   * tcp.yml  — MTProto-прокси, HostSNI(`proxy.example.com`) + tls.passthrough
+#   * cam.yml  — терминация TLS для site.example.com и проксирование на live
+# Правила не пересекаются: разные имена, разные маршруты.
+#
+# Traefik читает каталог /dynamic с watch=true, поэтому перезапуск не нужен —
+# достаточно положить файл, и маршрут появится (перезапуск уронил бы MTProto).
+# ---------------------------------------------------------------------------
+tls:
+  certificates:
+    - certFile: /dynamic/certs/site.example.com/fullchain.pem
+      keyFile: /dynamic/certs/site.example.com/privkey.pem
+
+http:
+  routers:
+    cam:
+      rule: "Host(`site.example.com`)"
+      entryPoints: [websecure]
+      service: cam-live
+      tls: {}
+
+    # порт 80 — только редирект на https
+    cam-http:
+      rule: "Host(`site.example.com`)"
+      entryPoints: [web]
+      middlewares: [cam-redirect]
+      service: cam-live
+
+  middlewares:
+    cam-redirect:
+      redirectScheme:
+        scheme: https
+        permanent: true
+
+  services:
+    cam-live:
+      loadBalancer:
+        servers:
+          - url: "http://live:8096"

@@ -1,0 +1,14 @@
+# real configuration never belongs in a public repository
+config.json
+profiles.json
+mtg.toml
+!*.example
+!mtg.toml.example
+token.key
+*.pem
+*.key
+!token.key.example
+# build products
+mtg-obfuscated2
+tproxy-server
+obftest

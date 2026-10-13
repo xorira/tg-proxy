@@ -1,0 +1,15 @@
+tcp:
+  routers:
+    tg-mtproto:
+      rule: "HostSNI(`proxy.example.com`)"
+      entryPoints:
+        - websecure
+      service: mtg
+      tls:
+        passthrough: true
+
+  services:
+    mtg:
+      loadBalancer:
+        servers:
+          - address: "mtg:3128"

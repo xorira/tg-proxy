@@ -1,0 +1,20 @@
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tproxy-relay
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - ./relay/config.json:/etc/tproxy-server/config.json:ro
+      - ./relay/profiles.json:/etc/tproxy-server/profiles.json:ro
+      - ./relay/token.key:/etc/tproxy-server/token.key:ro
+      - ./site:/srv/tproxy-site:ro
+    networks:
+      - double-take
+
+networks:
+  double-take:
+    external: true

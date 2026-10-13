@@ -1,0 +1,10 @@
+{
+  "profiles": [
+    {
+      "name": "default",
+      "secret": "<WEBPROXY_SECRET>",
+      "backend": "127.0.0.1:3128",
+      "carrier_mode": "https"
+    }
+  ]
+}

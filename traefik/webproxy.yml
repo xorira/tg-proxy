@@ -1,0 +1,45 @@
+# ---------------------------------------------------------------------------
+# Telegram WEB proxy (tproxy-server) — сервис `relay` из /opt/tg-webproxy.
+#
+# Добавлен РЯДОМ с tcp.yml и cam.yml и ничего в них не меняет:
+#   * tcp.yml      — MTProto-прокси, HostSNI(`proxy.example.com`) + passthrough
+#   * cam.yml      — терминация TLS для site.example.com
+#   * webproxy.yml — терминация TLS для webproxy.example.com -> релей
+#
+# Здесь терминируется обычный HTTPS (в отличие от proxy.example.com, где passthrough):
+# клиент Telegram ходит по HTTPS/WebSocket, поэтому маршрутизация по Host
+# работает штатно.
+#
+# Traefik читает каталог /dynamic с watch=true, перезапуск не нужен.
+# ---------------------------------------------------------------------------
+tls:
+  certificates:
+    - certFile: /dynamic/certs/webproxy.example.com/fullchain.pem
+      keyFile: /dynamic/certs/webproxy.example.com/privkey.pem
+
+http:
+  routers:
+    webproxy:
+      rule: "Host(`webproxy.example.com`)"
+      entryPoints: [websecure]
+      service: tproxy-relay
+      tls: {}
+
+    # порт 80 — только редирект на https
+    webproxy-http:
+      rule: "Host(`webproxy.example.com`)"
+      entryPoints: [web]
+      middlewares: [webproxy-redirect]
+      service: tproxy-relay
+
+  middlewares:
+    webproxy-redirect:
+      redirectScheme:
+        scheme: https
+        permanent: true
+
+  services:
+    tproxy-relay:
+      loadBalancer:
+        servers:
+          - url: "http://tproxy-relay:8082"

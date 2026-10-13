@@ -1,0 +1,431 @@
+diff --git a/internal/cli/doctor.go b/internal/cli/doctor.go
+index 48563bc..6faf2a9 100644
+--- a/internal/cli/doctor.go
++++ b/internal/cli/doctor.go
+@@ -118,11 +118,13 @@ func (d *Doctor) Run(cli *CLI, version string) error {
+ 		everythingOK = d.checkNetwork(value) && everythingOK
+ 	}
+ 
+-	fmt.Println("Validate fronting domain connectivity")
+-	everythingOK = d.checkFrontingDomain(base) && everythingOK
++	if d.conf.Secret.IsFakeTLS() {
++		fmt.Println("Validate fronting domain connectivity")
++		everythingOK = d.checkFrontingDomain(base) && everythingOK
+ 
+-	fmt.Println("Validate SNI-DNS match")
+-	everythingOK = d.checkSecretHost(resolver, base) && everythingOK
++		fmt.Println("Validate SNI-DNS match")
++		everythingOK = d.checkSecretHost(resolver, base) && everythingOK
++	}
+ 
+ 	if !everythingOK {
+ 		os.Exit(1)
+diff --git a/mtglib/internal/obfuscation/handshake_frame.go b/mtglib/internal/obfuscation/handshake_frame.go
+index 6e1f0a8..3b38502 100644
+--- a/mtglib/internal/obfuscation/handshake_frame.go
++++ b/mtglib/internal/obfuscation/handshake_frame.go
+@@ -2,6 +2,7 @@ package obfuscation
+ 
+ import (
+ 	"crypto/rand"
++	"crypto/subtle"
+ 	"encoding/binary"
+ 	"slices"
+ )
+@@ -34,8 +35,18 @@ const (
+ 	hfOffsetDC             = hfOffsetConnectionType + hfLenConnectionType
+ )
+ 
+-// Connection-Type: Secure. We support only fake tls.
+-var hfConnectionType = [hfLenConnectionType]byte{0xdd, 0xdd, 0xdd, 0xdd}
++// Connection-Type markers of the three stock MTProto transports. Stock MTProxy
++// accepts all of them, and mtg relays the inner stream opaquely, so restricting
++// the set to one marker only rejects valid clients. The faketls path uses
++// padded intermediate, the plain obfuscated2 path may use any of the three.
++var (
++	hfConnectionType     = [hfLenConnectionType]byte{0xdd, 0xdd, 0xdd, 0xdd}
++	hfConnectionTypeSet  = [][hfLenConnectionType]byte{
++		{0xef, 0xef, 0xef, 0xef}, // abridged
++		{0xee, 0xee, 0xee, 0xee}, // intermediate
++		{0xdd, 0xdd, 0xdd, 0xdd}, // padded intermediate
++	}
++)
+ 
+ type handshakeFrame struct {
+ 	data [hfLen]byte
+@@ -53,6 +64,20 @@ func (h *handshakeFrame) connectionType() []byte {
+ 	return h.data[hfOffsetConnectionType : hfOffsetConnectionType+hfLenConnectionType]
+ }
+ 
++// connectionTypeSupported reports whether the frame carries one of the stock
++// MTProto transport markers.
++func (h *handshakeFrame) connectionTypeSupported() bool {
++	val := h.connectionType()
++
++	for _, candidate := range hfConnectionTypeSet {
++		if subtle.ConstantTimeCompare(val, candidate[:]) == 1 {
++			return true
++		}
++	}
++
++	return false
++}
++
+ func (h *handshakeFrame) dcSlice() []byte {
+ 	return h.data[hfOffsetDC : hfOffsetDC+2]
+ }
+diff --git a/mtglib/internal/obfuscation/obfuscator.go b/mtglib/internal/obfuscation/obfuscator.go
+index 09e63f1..c545a20 100644
+--- a/mtglib/internal/obfuscation/obfuscator.go
++++ b/mtglib/internal/obfuscation/obfuscator.go
+@@ -4,7 +4,6 @@ import (
+ 	"crypto/aes"
+ 	"crypto/cipher"
+ 	"crypto/sha256"
+-	"crypto/subtle"
+ 	"encoding/hex"
+ 	"fmt"
+ 	"hash"
+@@ -33,8 +32,8 @@ func (o Obfuscator) ReadHandshake(r essentials.Conn) (int, essentials.Conn, erro
+ 
+ 	recvCipher.XORKeyStream(frame.data[:], frame.data[:])
+ 
+-	if val := frame.connectionType(); subtle.ConstantTimeCompare(val, hfConnectionType[:]) != 1 {
+-		return 0, nil, fmt.Errorf("unsupported connection type: %s", hex.EncodeToString(val))
++	if !frame.connectionTypeSupported() {
++		return 0, nil, fmt.Errorf("unsupported connection type: %s", hex.EncodeToString(frame.connectionType()))
+ 	}
+ 
+ 	cn := conn{
+diff --git a/mtglib/proxy.go b/mtglib/proxy.go
+index a89e18c..92d64e4 100644
+--- a/mtglib/proxy.go
++++ b/mtglib/proxy.go
+@@ -55,6 +55,12 @@ func (p *Proxy) DomainFrontingAddress() string {
+ 		host = p.domainFrontingIP
+ 	}
+ 
++	// Domain fronting is a faketls disguise: the obfuscated2-only modes have no
++	// hostname to fall back to.
++	if host == "" {
++		return ""
++	}
++
+ 	return net.JoinHostPort(host, strconv.Itoa(p.domainFrontingPort))
+ }
+ 
+@@ -85,18 +91,22 @@ func (p *Proxy) ServeConn(conn essentials.Conn) {
+ 		ctx.logger.Info("Stream has been finished")
+ 	}()
+ 
+-	if !p.doFakeTLSHandshake(ctx) {
+-		return
+-	}
++	// Only faketls secrets carry a TLS wrapper and the doppelganger disguise.
++	// The stock MTProxy modes (dd/secured and simple) speak plain obfuscated2.
++	if p.secret.IsFakeTLS() {
++		if !p.doFakeTLSHandshake(ctx) {
++			return
++		}
+ 
+-	clientConn, err := p.doppelGanger.NewConn(ctx.clientConn)
+-	if err != nil {
+-		ctx.logger.InfoError("cannot wrap into doppelganger connection", err)
+-		return
+-	}
+-	defer clientConn.Stop()
++		clientConn, err := p.doppelGanger.NewConn(ctx.clientConn)
++		if err != nil {
++			ctx.logger.InfoError("cannot wrap into doppelganger connection", err)
++			return
++		}
++		defer clientConn.Stop()
+ 
+-	ctx.clientConn = clientConn
++		ctx.clientConn = clientConn
++	}
+ 
+ 	if err := p.doObfuscatedHandshake(ctx); err != nil {
+ 		ctx.logger.InfoError("obfuscated handshake is failed", err)
+diff --git a/mtglib/secret.go b/mtglib/secret.go
+index 2788ecc..f8be73c 100644
+--- a/mtglib/secret.go
++++ b/mtglib/secret.go
+@@ -7,43 +7,57 @@ import (
+ 	"fmt"
+ )
+ 
+-const secretFakeTLSFirstByte byte = 0xee
++const (
++	secretFakeTLSFirstByte byte = 0xee
++	secretSecuredFirstByte byte = 0xdd
++)
+ 
+ var secretEmptyKey [SecretKeyLength]byte
+ 
++// SecretMode defines how a client is expected to talk to this proxy.
++type SecretMode int
++
++const (
++	// SecretModeFakeTLS is the stock mtg behaviour: a faketls handshake on the
++	// outside carrying an obfuscated2 handshake inside it. The secret also
++	// carries a domain fronting hostname.
++	SecretModeFakeTLS SecretMode = iota
++
++	// SecretModeSecured is the stock MTProxy "dd" mode: plain obfuscated2 with
++	// random padding, no TLS layer at all.
++	SecretModeSecured
++
++	// SecretModeSimple is the stock MTProxy "simple" mode: plain obfuscated2,
++	// no padding and no TLS layer.
++	SecretModeSimple
++)
++
+ // Secret is a data structure that presents a secret.
+ //
+-// Telegram secret is not a simple string like
+-// "ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d".
+-// Actually, this is a serialized datastructure of 2 parts: key and host.
+-//
+-//	ee367a189aee18fa31c190054efd4a8e9573746f726167652e676f6f676c65617069732e636f6d
+-//	|-|-------------------------------|-------------------------------------------
+-//	p key                             hostname
+-//
+-// Serialized secret starts with 'ee'. Actually, in the past we also had 'dd'
+-// secrets and prefixless ones. But this is history. Currently, we do have only
+-// 'ee' secrets which mean faketls + protection from statistical attacks on a
+-// length. 'ee' is a byte 238 (0xee).
++// Telegram secret is not a simple string. There are three shapes of it, and the
++// shape decides the transport mode:
+ //
+-// After that, we have 16 bytes of the key. This is a random generated secret
+-// data of the proxy and this data is used to derive authentication schemas.
+-// These secrets are mixed into hmacs and sha256 checksums which are used to
+-// build AEAD ciphers for obfuscated2 protocol and ensure faketls handshake.
++//	ee<16 bytes key><hostname>   faketls wrapper + obfuscated2 inside (stock mtg)
++//	dd<16 bytes key>             obfuscated2 with random padding (stock MTProxy "secured")
++//	<16 bytes key>               obfuscated2 without padding (stock MTProxy "simple")
+ //
+-// Host is a domain fronting hostname in latin1 (ASCII) encoding. This hostname
+-// should be used for SNI in faketls and MTG verifies it. Also, this is when
+-// mtg gets about a domain fronting hostname.
+-//
+-// Secrets can be serialized into 2 forms: hex and base64. If you decode both
+-// forms into bytes, you'll get the same byte array. Telegram clients nowadays
+-// accept all forms.
++// The first two are unambiguous by length: a 17 byte value can only be the
++// secured form, a 16 byte value can only be the simple one. A hostname is only
++// present in the faketls form.
+ type Secret struct {
+ 	// Key is a set of bytes used for traffic authentication.
+ 	Key [SecretKeyLength]byte
+ 
+-	// Host is a domain fronting hostname.
++	// Host is a domain fronting hostname. Only set in faketls mode.
+ 	Host string
++
++	// Mode is the transport mode this secret selects.
++	Mode SecretMode
++}
++
++// IsFakeTLS reports whether this secret uses the faketls wrapper.
++func (s Secret) IsFakeTLS() bool {
++	return s.Mode == SecretModeFakeTLS
+ }
+ 
+ // MarshalText is to support text.Marshaller interface.
+@@ -78,20 +92,27 @@ func (s *Secret) Set(text string) error {
+ 		return fmt.Errorf("secret is truncated, length=%d", len(decoded))
+ 	}
+ 
+-	if decoded[0] != secretFakeTLSFirstByte {
+-		return fmt.Errorf("incorrect first byte of secret: %#x", decoded[0])
+-	}
+-
+-	decoded = decoded[1:]
+-	if len(decoded) < SecretKeyLength {
+-		return fmt.Errorf("secret has incorrect length %d", len(decoded))
+-	}
+-
+-	copy(s.Key[:], decoded[:SecretKeyLength])
+-	s.Host = string(decoded[SecretKeyLength:])
+-
+-	if s.Host == "" {
+-		return fmt.Errorf("hostname cannot be empty: %s", text)
++	switch {
++	case len(decoded) > SecretKeyLength && decoded[0] == secretFakeTLSFirstByte:
++		decoded = decoded[1:]
++		copy(s.Key[:], decoded[:SecretKeyLength])
++		s.Host = string(decoded[SecretKeyLength:])
++
++		if s.Host == "" {
++			return fmt.Errorf("hostname cannot be empty: %s", text)
++		}
++
++		s.Mode = SecretModeFakeTLS
++	case len(decoded) == SecretKeyLength+1 && decoded[0] == secretSecuredFirstByte:
++		copy(s.Key[:], decoded[1:])
++		s.Host = ""
++		s.Mode = SecretModeSecured
++	case len(decoded) == SecretKeyLength:
++		copy(s.Key[:], decoded)
++		s.Host = ""
++		s.Mode = SecretModeSimple
++	default:
++		return fmt.Errorf("incorrect secret format: length=%d first byte=%#x", len(decoded), decoded[0])
+ 	}
+ 
+ 	return nil
+@@ -99,7 +120,15 @@ func (s *Secret) Set(text string) error {
+ 
+ // Valid checks if this secret is valid and can be used in proxy.
+ func (s Secret) Valid() bool {
+-	return s.Key != secretEmptyKey && s.Host != ""
++	if s.Key == secretEmptyKey {
++		return false
++	}
++
++	if s.Mode == SecretModeFakeTLS {
++		return s.Host != ""
++	}
++
++	return true
+ }
+ 
+ // String is to support fmt.Stringer interface.
+@@ -112,24 +141,49 @@ func (s Secret) Base64() string {
+ 	return base64.RawURLEncoding.EncodeToString(s.makeBytes())
+ }
+ 
+-// Hex returns a hex-encoded form of this secret (ee-secret).
++// Hex returns a hex-encoded form of this secret.
+ func (s Secret) Hex() string {
+ 	return hex.EncodeToString(s.makeBytes())
+ }
+ 
+ func (s *Secret) makeBytes() []byte {
+-	data := append([]byte{secretFakeTLSFirstByte}, s.Key[:]...)
+-	data = append(data, s.Host...)
++	switch s.Mode {
++	case SecretModeFakeTLS:
++		data := append([]byte{secretFakeTLSFirstByte}, s.Key[:]...)
++		data = append(data, s.Host...)
++
++		return data
++	case SecretModeSecured:
++		return append([]byte{secretSecuredFirstByte}, s.Key[:]...)
++	case SecretModeSimple:
++		return s.Key[:]
++	}
+ 
+-	return data
++	return s.Key[:]
+ }
+ 
+-// GenerateSecret makes a new secret with a given hostname.
++// GenerateSecret makes a new faketls secret with a given hostname.
+ func GenerateSecret(hostname string) Secret {
+ 	s := Secret{
+ 		Host: hostname,
++		Mode: SecretModeFakeTLS,
++	}
++
++	if _, err := rand.Read(s.Key[:]); err != nil {
++		panic(err)
++	}
++
++	return s
++}
++
++// GenerateSecretOfMode makes a new secret of the requested mode. A hostname is
++// only meaningful for SecretModeFakeTLS.
++func GenerateSecretOfMode(hostname string, mode SecretMode) Secret {
++	if mode == SecretModeFakeTLS {
++		return GenerateSecret(hostname)
+ 	}
+ 
++	s := Secret{Mode: mode}
+ 	if _, err := rand.Read(s.Key[:]); err != nil {
+ 		panic(err)
+ 	}
+diff --git a/mtglib/secret_test.go b/mtglib/secret_test.go
+index c1f2923..f42bfe8 100644
+--- a/mtglib/secret_test.go
++++ b/mtglib/secret_test.go
+@@ -35,6 +35,8 @@ func (suite *SecretTestSuite) TestParseSecret() {
+ 			assert.NoError(t, err)
+ 			assert.Equal(t, s.Key, parsed.Key)
+ 			assert.Equal(t, s.Host, parsed.Host)
++			assert.Equal(t, mtglib.SecretModeFakeTLS, parsed.Mode)
++			assert.True(t, parsed.IsFakeTLS())
+ 
+ 			newSecret := mtglib.Secret{}
+ 			assert.NoError(t, newSecret.UnmarshalText([]byte(param)))
+@@ -76,18 +78,20 @@ func (suite *SecretTestSuite) TestMarshalData() {
+ }
+ 
+ func (suite *SecretTestSuite) TestIncorrectSecret() {
++	// Fork change: the stock MTProxy "secured" (dd-prefixed, 17 byte) and
++	// "simple" (prefixless, 16 byte) shapes are accepted now, so they are no
++	// longer errors. What stays invalid: wrong lengths, non-canonical
++	// encodings and empty input.
+ 	testData := []string{
+ 		"aaa",
+-		"d11c6cbbd9efe7fed5bc0db220b09665",
+-		"ddd11c6cbbd9efe7fed5bc0db220b09665",
+ 		"+ueJ0q91t5XOnFYP8Xac3A",
+ 		"eed11c6cbbd9efe7fed5bc0db220b09665",
+-		"eed11c6cbbd9efe7fed5bc0db220b096",
+-		"ed11c6cbbd9efe7fed5bc0db220b09665",
+ 		"",
+ 		"+**",
+ 		"ee",
+-		"efd11c6cbbd9efe7fed5bc0db220b09665",
++		"dd",
++		"d11c6cbbd9efe7fed5bc0db220b096",
++		"d11c6cbbd9efe7fed5bc0db220b0966565",
+ 	}
+ 
+ 	for _, v := range testData {
+@@ -121,6 +125,41 @@ func (suite *SecretTestSuite) TestValid() {
+ 	suite.True(s.Valid())
+ }
+ 
++func (suite *SecretTestSuite) TestParseSecuredSecret() {
++	// 17 byte "dd" secret: stock MTProxy secured mode, no TLS wrapper.
++	param := "ddd11c6cbbd9efe7fed5bc0db220b09665"
++
++	parsed, err := mtglib.ParseSecret(param)
++	suite.NoError(err)
++	suite.Equal(mtglib.SecretModeSecured, parsed.Mode)
++	suite.False(parsed.IsFakeTLS())
++	suite.Empty(parsed.Host)
++	suite.True(parsed.Valid())
++	suite.Equal(param, parsed.Hex())
++}
++
++func (suite *SecretTestSuite) TestParseSimpleSecret() {
++	// 16 byte prefixless secret: stock MTProxy simple mode.
++	param := "d11c6cbbd9efe7fed5bc0db220b09665"
++
++	parsed, err := mtglib.ParseSecret(param)
++	suite.NoError(err)
++	suite.Equal(mtglib.SecretModeSimple, parsed.Mode)
++	suite.False(parsed.IsFakeTLS())
++	suite.Empty(parsed.Host)
++	suite.True(parsed.Valid())
++	suite.Equal(param, parsed.Hex())
++}
++
++func (suite *SecretTestSuite) TestSecuredSecretRoundTrip() {
++	generated := mtglib.GenerateSecretOfMode("", mtglib.SecretModeSecured)
++
++	parsed, err := mtglib.ParseSecret(generated.Hex())
++	suite.NoError(err)
++	suite.Equal(generated.Key, parsed.Key)
++	suite.Equal(mtglib.SecretModeSecured, parsed.Mode)
++}
++
+ func TestSecret(t *testing.T) {
+ 	t.Parallel()
+ 	suite.Run(t, &SecretTestSuite{})
