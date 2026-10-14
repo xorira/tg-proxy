@@ -172,3 +172,34 @@ docker exec <container> wget -qO- http://127.0.0.1:8081/readyz    # backend reac
 `readyz` is the useful one: it separates "the relay is up" from "the tunnel to
 Telegram is up". A container healthcheck on `readyz` turns a silent backend
 failure into a restart.
+
+## 10. socat dies with SIGILL under a restrictive AppArmor profile
+
+**Symptom.** A container that starts three processes — an MTProxy backend, the
+relay and a `socat` forwarder — exits a couple of seconds after start. Its log
+shows the relay coming up and then `shutdown signal=terminated`, and nothing
+about the forwarder. Run `socat` on its own as the container entrypoint and it
+exits **132**, which is 128 + 4: killed by `SIGILL`, an illegal instruction.
+
+Nothing is wrong with the binary. `socat -V` runs fine, the package version is
+identical to a working host, and the same image works elsewhere.
+
+**Cause.** The `docker-default` AppArmor profile on this host mediates `AF_UNIX`
+and ships without `unix` rules. Something in socat's listen path is refused and
+the failure surfaces as `SIGILL` rather than a clean `EPERM`. The give-away is
+the comparison:
+
+| | |
+|---|---|
+| `docker run --entrypoint socat …` | exit `132` |
+| `docker run --security-opt apparmor=unconfined --entrypoint socat …` | survives |
+| a container started by compose with `security_opt: [apparmor:unconfined]` | survives |
+
+**Fix.** `--security-opt apparmor:unconfined` on the container. Document it for
+the host rather than baking it into the image: it is an environment property, not
+a property of the software.
+
+**Why it is worth writing down.** The failure is completely silent — no message
+from the process that died, and the only visible symptom is the *other* component
+being terminated by the supervisor's cleanup. A supervisor that names the
+component it saw exit turns an afternoon of guessing into one line of log.

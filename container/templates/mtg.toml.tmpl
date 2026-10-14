@@ -1,0 +1,19 @@
+secret = "__SECRET__"
+bind-to = "127.0.0.1:3128"
+prefer-ip = "prefer-ipv4"
+auto-update = false
+concurrency = 4096
+
+[network]
+proxies = __PROXIES__
+dns = "__DNS__"
+
+[network.timeout]
+tcp = "10s"
+idle = "5m"
+
+[defense.blocklist]
+enabled = false
+
+[defense.allowlist]
+enabled = false

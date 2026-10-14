@@ -65,6 +65,68 @@ numeric loopback address, which is exactly why the backend must share its networ
 namespace and why `socat` — not the front proxy — is what faces the container
 network. See [`docs/02-web-proxy.md`](docs/02-web-proxy.md).
 
+## Running the published image
+
+A ready image is built from this repository by GitHub Actions and published to
+`ghcr.io/xorira/tg-webproxy`. Configuration is entirely environment driven, so
+there are no files to prepare:
+
+```bash
+docker run -d --name tg-webproxy --restart unless-stopped \
+  -e PUBLIC_HOSTNAME=proxy.example.com \
+  -e SECRET=dd00112233445566778899aabbccddeeff \
+  -e SOCKS5=socks5://10.0.0.5:1080 \
+  -v tgwebproxy:/data \
+  -v /srv/my-site:/srv/tproxy-site:ro \
+  ghcr.io/xorira/tg-webproxy:latest
+```
+
+The container prints the client link on startup:
+
+```
+tg-webproxy: server    : proxy.example.com/t7k2xwpbq3abcd
+tg-webproxy: secret    : cN0AESIzRFVmd4iZqrvM3e7_
+tg-webproxy: link      : https://t.me/webproxy?server=...&secret=...
+```
+
+Point your front proxy at the container's port **8082** and route the whole
+hostname to it, exactly as in `traefik/webproxy.yml`.
+
+### Environment
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `PUBLIC_HOSTNAME` | **yes** | the name clients connect to; the bridge capability is bound to it |
+| `SECRET` | **yes** | client-facing MTProxy secret, `dd`-prefixed or 16-byte hex. Must be a stock MTProxy secret: the same bytes go to the backend |
+| `BASE_PATH` | no | path prefix; generated as random base32 when omitted. **Pin it** — a new value changes every client link |
+| `SOCKS5` | no | upstream proxy for the backend. Without it the backend dials Telegram directly, which fails on a censored uplink |
+| `CARRIER_MODE` | no | `https` (default), `https-lanes`, `websocket`, `websocket-lanes` |
+| `ALLOW_PLACEHOLDER_SITE` | no | set to `yes` to run with the bundled placeholder. See below |
+| `DNS` | no | resolver for the backend, defaults to Docker's `127.0.0.11` |
+
+### Two things the image insists on
+
+**Mount a volume at `/data`.** It holds the 32-byte session signing key. Without
+a volume the key is regenerated whenever the container is replaced and every live
+session drops.
+
+**Supply your own site.** The relay presents itself as an ordinary website. A
+placeholder shared by everyone who pulls this image is an active-probing
+signature, so the entrypoint refuses to fall back to it unless you pass
+`-e ALLOW_PLACEHOLDER_SITE=yes`. Mount yours at `/srv/tproxy-site`.
+
+### Hosts with restrictive AppArmor
+
+On a host where AppArmor mediates `AF_UNIX` and `docker-default` has no `unix`
+rules, `socat` dies with `SIGILL` and takes the stack with it. Add:
+
+```bash
+--security-opt apparmor=unconfined
+```
+
+The container then reports `component 'socat' exited` in its logs. See
+[`docs/04-troubleshooting.md`](docs/04-troubleshooting.md) for the diagnosis.
+
 ## Layout
 
 ```
