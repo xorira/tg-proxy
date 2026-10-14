@@ -39,9 +39,44 @@ plaintext hostname is your proxy's name, this is your bug:
 echo "<base64-secret>=" | base64 -d | strings
 ```
 
-**Fix.** Re-issue the secret with a hostname that resolves somewhere else, update
-the `HostSNI` rule to match, and redistribute the links. There is no config-only
-escape.
+**Fix that stops the bleeding without touching clients.** The hostname only ever
+matters as a *dial target*, and Docker resolves it through its own embedded DNS,
+which serves `extra_hosts` first. Point the name at loopback inside the proxy
+container:
+
+```yaml
+services:
+  mtg:
+    extra_hosts:
+      - "tg.xorira.ru:127.0.0.1"
+```
+
+The fallback dial now lands on `127.0.0.1:443` inside the container's own network
+namespace, where nothing listens. It fails instantly instead of looping, the
+secret is unchanged, and no client link has to be reissued.
+
+Measured on the affected host, with the same traffic:
+
+| | before | after |
+|---|---|---|
+| load average | 48–61 | under 5 |
+| `%Cpu(s)` | 91.8 sy, **0.0 id** | 4.3 sy, **91.9 id** |
+| proxy CPU | 118% | 0% |
+| front proxy CPU | 126% | 0% |
+| `docker-proxy` CPU | 114% | 0% |
+| connections from the proxy to its own address | 466 | 0 |
+| log lines per 5 s | thousands | 0 |
+
+**What this costs.** Domain fronting is what makes active probing useless: a
+rejected request is supposed to be relayed to a real website so a prober sees an
+ordinary site. Pointing the name at loopback turns that into a closed connection.
+If the fronting dial was already failing — which is how this loop presents in the
+first place — nothing is lost, but the disguise is not restored either.
+
+**Proper fix.** Re-issue the secret with a hostname that resolves to a real
+website on a *different* host, update the `HostSNI` rule to match, and
+redistribute the links. The same `extra_hosts` lever can be used to verify the
+choice before committing to it.
 
 ## 2. obfuscated2 cannot be routed by hostname
 
